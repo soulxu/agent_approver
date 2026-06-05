@@ -1,0 +1,12 @@
+{
+  "url": "http://127.0.0.1:8799",
+  "approval_timeout_ms": 150000,
+  "shell_mode": "risky",
+  "mcp_mode": "off",
+  "fallback": "ask",
+  "activity": true,
+  "risky_patterns": [
+    "\\bterraform\\s+apply\\b",
+    "\\bkubectl\\s+delete\\b"
+  ]
+}
