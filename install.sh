@@ -54,6 +54,15 @@ fi
 [[ -n "$PYTHON" ]] || { echo "需要 python3"; exit 1; }
 chmod +x "$HOOK" "$RELAY" || true
 
+# 0) BLE 依赖 (relay 蓝牙端需要 bleak; hook 只用标准库)
+if "$PYTHON" -c "import bleak" 2>/dev/null; then
+  echo "[deps] bleak 已安装"
+else
+  echo "[deps] 安装 bleak (relay 蓝牙端需要) ..."
+  "$PYTHON" -m pip install --user bleak || \
+    echo "[deps] !! bleak 安装失败, 请手动: $PYTHON -m pip install bleak"
+fi
+
 # 1) 默认配置
 mkdir -p "$CFG_DIR"
 if [[ ! -f "$CFG" ]]; then
@@ -110,8 +119,11 @@ fi
 
 echo
 echo "安装完成. 下一步:"
-echo "  1) 启动 relay (若没用 --launchd):  $PYTHON $RELAY"
-echo "     启动日志里会打印 'StickS3 relay URL -> http://<你的IP>:8799'"
-echo "  2) 给 StickS3 烧固件:  $HERE/firmware/flash.sh"
-echo "  3) StickS3 配网后, 在它的网页里把 relay URL 填进去"
-echo "  4) 重启 Cursor 让 hooks 生效 (设置 -> Hooks 里能看到)"
+echo "  1) 给 StickS3 烧固件:  $HERE/firmware/flash.sh"
+echo "     (它会广播为 BLE 设备 'AgentApprover')"
+echo "  2) 启动 relay (若没用 --launchd):  $PYTHON $RELAY"
+echo "     首次会通过蓝牙连接并配对 StickS3 (系统可能弹一次配对确认)."
+echo "  3) 重启 Cursor 让 hooks 生效 (设置 -> Hooks 里能看到)"
+echo
+echo "注意: relay 走蓝牙, 首次运行 macOS 可能要你授权 '蓝牙' 权限"
+echo "      (系统设置 -> 隐私与安全性 -> 蓝牙). 用 --launchd 自启时尤其注意."

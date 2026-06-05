@@ -1,36 +1,31 @@
 #!/usr/bin/env python3
 # =============================================================================
-# agent_approver relay - Mac 上跑的小 HTTP 中枢, 把 "agent 的审批请求 / 活动状态"
-# 转发给 M5StickS3, 再把 StickS3 上按键的批准/拒绝结果回传给 agent 的 hook.
+# agent_approver relay (BLE 版) - Mac 上跑的小中枢, 把 "agent 的审批请求 / 活动
+# 状态" 通过 *蓝牙* 推给 M5StickS3, 再把 StickS3 上按键的批准/拒绝结果回传给
+# agent 的 hook.
 #
-# 为什么要一个中枢 (而不是 hook 直接打 StickS3):
-#   - hook 跑在 Mac 上, 打 127.0.0.1 又快又稳, 不用知道 StickS3 的 LAN IP;
-#   - StickS3 只会 "往外连" (跟 stick_s3_eyes 的 bridge 一样), 用 long-poll
-#     拉取待办, 不需要在 stick 上跑被外部访问的 server;
-#   - 中枢能在 StickS3 离线时立刻回退 (hook -> Cursor 原生审批), 不会把 agent
-#     卡死.
-#
-# 链路:
+# 链路 (两段):
 #   Cursor/Claude/Codex agent
 #        │  hook (beforeShellExecution / afterFileEdit / stop / ...)
 #        ▼
-#   hook.py  ──HTTP 127.0.0.1:8799──▶  relay.py
+#   hook.py ──明文 HTTP 127.0.0.1:8799──▶ relay.py (回环, 只本机可达)
 #                                          │  pending 审批 + 最新活动
-#                                          ▲
-#                                          │  HTTP LAN long-poll
-#                                     M5StickS3 (WiFi)
-#                                       GET  /stick/poll?v=<ver>&wait=25
-#                                       POST /stick/decide {id, decision}
+#                                          ▲ BLE (Nordic UART Service)
+#                                          │  relay 当 central 主动连过去
+#                                     M5StickS3 (BLE 外设 "AgentApprover")
 #
-# 只用 Python 标准库, 一行 pip 都不装. 兼容 Python 3.9 (macOS 自带).
+# 信任: 首次 BLE 配对+绑定 (加密), 之后长期信任, 不用 WiFi / 不用证书.
+# StickS3 离线 (没连上 BLE) -> hook 立刻回退 Cursor 原生审批, 不卡死 agent.
+#
+# 依赖: 蓝牙部分用 bleak (pip 装). hook 那段只用标准库. bleak 没装时 relay 仍能
+# 起 (hook 会一直回退). 兼容 Python 3.9+.
 # =============================================================================
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import re
-import subprocess
+import queue
 import sys
 import threading
 import time
@@ -38,16 +33,19 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, List, Optional
+from typing import Optional
+
+try:
+    import ble as ble_mod
+except Exception:  # noqa: BLE001
+    ble_mod = None
 
 
-# StickS3 屏幕窄, detail 太长没意义, 这里先裁一刀 (UTF-8 字节). 标题更短.
-MAX_DETAIL_BYTES = 600
-MAX_TITLE_BYTES = 160
-MAX_ACTIVITY_BYTES = 400
-
-# 多久没收到 StickS3 的 poll 就认为它离线. long-poll 默认 25s, 给 2.5 倍余量.
-STICK_OFFLINE_SEC = 60.0
+# StickS3 屏幕窄, 也受 BLE 单包大小限制, 裁一刀.
+MAX_DETAIL_BYTES = 800
+MAX_TITLE_BYTES = 120
+MAX_SUMMARY_BYTES = 1200
+MAX_ACTIVITY_BYTES = 300
 
 
 def _ts() -> str:
@@ -78,6 +76,7 @@ def _trim_utf8(s: str, max_bytes: int) -> str:
 class Approval:
     id: str
     agent: str
+    agent_id: str
     tool: str
     title: str
     detail: str
@@ -88,42 +87,103 @@ class Approval:
     decision: Optional[str] = None  # "allow" | "deny"
 
 
+MAX_AGENTS = 16
+MAX_LABEL_BYTES = 48
+
+
 class State:
     def __init__(self) -> None:
         self.cond = threading.Condition()
-        self.version = 1
         self.pending: "OrderedDict[str, Approval]" = OrderedDict()
-        self.activity: Optional[dict] = None
-        self.recent: List[dict] = []  # 给状态网页看的活动 ring
-        self.last_stick_poll = 0.0
+        # 每个 agent (按 conversation_id) 的当前状态: id -> info dict
+        self.agents: "OrderedDict[str, dict]" = OrderedDict()
+        self.ble_connected = False
+        # 待发往 stick 的 BLE 消息 (BLE worker 线程消费)
+        self.outbox: "queue.Queue[dict]" = queue.Queue()
 
-    # ---- 内部: 改了状态就 bump version + 唤醒所有 long-poll ----
-    def _bump_locked(self) -> None:
-        self.version += 1
-        self.cond.notify_all()
+    # ---- BLE 消息构造 ----
+    @staticmethod
+    def _agent_msg(a: dict) -> dict:
+        return {
+            "t": "agent", "id": a["id"], "label": a["label"],
+            "state": a["state"], "text": a["text"],
+        }
+
+    @staticmethod
+    def _approval_msg(ap: Approval) -> dict:
+        return {
+            "t": "approval",
+            "id": ap.id, "agent": ap.agent, "tool": ap.tool,
+            "title": ap.title, "detail": ap.detail, "cwd": ap.cwd,
+            "timeout_ms": ap.timeout_ms,
+        }
+
+    # ---- BLE worker 回调 ----
+    def on_ble_up(self) -> None:
+        with self.cond:
+            self.ble_connected = True
+            # 清空积压, 重置 stick, 再把当前所有 agent + 待审批同步过去
+            self._drain_outbox_locked()
+            self._enqueue({"t": "reset"})
+            for a in self.agents.values():
+                self._enqueue(self._agent_msg(a))
+                if a.get("summary"):
+                    self._enqueue({"t": "agent_summary", "id": a["id"], "summary": a["summary"]})
+            for ap in self.pending.values():
+                self._enqueue(self._approval_msg(ap))
+            self.cond.notify_all()
+        log("BLE stick connected")
+
+    def on_ble_down(self) -> None:
+        with self.cond:
+            if not self.ble_connected:
+                return
+            self.ble_connected = False
+            self._drain_outbox_locked()
+            self.cond.notify_all()
+        log("BLE stick disconnected")
+
+    def _drain_outbox_locked(self) -> None:
+        try:
+            while True:
+                self.outbox.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _enqueue(self, msg: dict) -> None:
+        if self.ble_connected:
+            self.outbox.put(msg)
 
     def stick_online(self) -> bool:
-        return (time.time() - self.last_stick_poll) < STICK_OFFLINE_SEC
+        return self.ble_connected
+
+    def _upsert_agent_locked(self, agent_id: str, **fields) -> dict:
+        a = self.agents.pop(agent_id, None) or {
+            "id": agent_id, "label": "agent", "source": "",
+            "state": "busy", "kind": "", "text": "", "cwd": "", "summary": "",
+        }
+        a.update({k: v for k, v in fields.items() if v is not None})
+        a["ts"] = time.time()
+        self.agents[agent_id] = a  # 移到末尾 = 最近活跃
+        while len(self.agents) > MAX_AGENTS:
+            self.agents.popitem(last=False)
+        return a
 
     # ---- hook 侧: 新增一个待审批, 阻塞等结果 ----
     def submit_approval(self, ap: Approval) -> str:
         with self.cond:
-            online = self.stick_online()
-            if not online:
+            if not self.ble_connected:
                 return "unavailable"
             self.pending[ap.id] = ap
-            self.activity = {
-                "agent": ap.agent,
-                "kind": "approval",
-                "text": ap.title,
-                "cwd": ap.cwd,
-                "ts": ap.created,
-            }
-            self._bump_locked()
+            a = self._upsert_agent_locked(
+                ap.agent_id, label=(ap.agent or None),
+                state="wait", kind="approval", text=ap.title, cwd=ap.cwd,
+            )
+            self._enqueue(self._agent_msg(a))
+            self._enqueue(self._approval_msg(ap))
         log(f"approval+ id={ap.id[:8]} agent={ap.agent} tool={ap.tool} :: {ap.title}")
 
         deadline = ap.created + ap.timeout_ms / 1000.0
-        # 等按键结果; 同时定期检查超时 / stick 掉线.
         while True:
             remaining = deadline - time.time()
             if remaining <= 0:
@@ -131,98 +191,96 @@ class State:
             if ap.event.wait(timeout=min(remaining, 2.0)):
                 break
             with self.cond:
-                if not self.stick_online():
-                    # stick 中途掉线, 别再傻等到超时.
+                if not self.ble_connected:
                     self._remove_locked(ap.id)
-                    log(f"approval~ id={ap.id[:8]} stick offline -> unavailable")
+                    log(f"approval~ id={ap.id[:8]} ble offline -> unavailable")
                     return "unavailable"
 
         with self.cond:
             self._remove_locked(ap.id)
-            if ap.decision in ("allow", "deny"):
-                log(f"approval= id={ap.id[:8]} -> {ap.decision}")
-                return ap.decision
-            log(f"approval= id={ap.id[:8]} -> timeout")
-            return "timeout"
+            decision = ap.decision
+            a = self.agents.get(ap.agent_id)
+            if a is not None:
+                a["state"] = "busy"
+                a["kind"] = "approval_done"
+                a["text"] = ("已批准: " if decision == "allow"
+                             else "已拒绝: " if decision == "deny"
+                             else "审批超时: ") + ap.title
+                a["ts"] = time.time()
+                self._enqueue(self._agent_msg(a))
+            self._enqueue({"t": "cancel", "id": ap.id})
+        if decision in ("allow", "deny"):
+            log(f"approval= id={ap.id[:8]} -> {decision}")
+            return decision
+        log(f"approval= id={ap.id[:8]} -> timeout")
+        return "timeout"
 
     def _remove_locked(self, ap_id: str) -> None:
         if ap_id in self.pending:
             del self.pending[ap_id]
-            self._bump_locked()
 
-    # ---- stick 侧: 给出决定 ----
+    # ---- BLE 侧: stick 给出决定 ----
     def decide(self, ap_id: str, decision: str) -> bool:
+        if decision not in ("allow", "deny"):
+            return False
         with self.cond:
             ap = self.pending.get(ap_id)
             if ap is None:
                 return False
             ap.decision = decision
             ap.event.set()
-            self._bump_locked()
+            self.cond.notify_all()
         log(f"decide  id={ap_id[:8]} <- {decision} (from stick)")
         return True
 
-    # ---- hook 侧: 更新活动 (非阻塞) ----
-    def set_activity(self, agent: str, kind: str, text: str, cwd: str) -> None:
-        item = {
-            "agent": agent,
-            "kind": kind,
-            "text": _trim_utf8(text, MAX_ACTIVITY_BYTES),
-            "cwd": cwd,
-            "ts": time.time(),
-        }
+    # ---- hook 侧: 更新某个 agent 的状态 (非阻塞) ----
+    def set_status(self, agent_id: str, label: str, source: str,
+                   state: str, kind: str, text: str, cwd: str,
+                   summary: str = "") -> None:
         with self.cond:
-            self.activity = item
-            self.recent.append(item)
-            if len(self.recent) > 50:
-                self.recent = self.recent[-50:]
-            self._bump_locked()
+            if state == "end":
+                if agent_id in self.agents:
+                    del self.agents[agent_id]
+                    self._enqueue({"t": "agent_del", "id": agent_id})
+                return
+            sm = _trim_utf8(summary, MAX_SUMMARY_BYTES) if summary else None
+            a = self._upsert_agent_locked(
+                agent_id,
+                label=(_trim_utf8(label, MAX_LABEL_BYTES) if label else None),
+                source=(source or None),
+                state=(state or "busy"),
+                kind=kind,
+                text=_trim_utf8(text, MAX_ACTIVITY_BYTES),
+                cwd=cwd,
+                summary=sm,
+            )
+            self._enqueue(self._agent_msg(a))
+            # 总结单独发 (较长, 只在变化时发, 不拖慢普通状态更新)
+            if sm:
+                self._enqueue({"t": "agent_summary", "id": agent_id, "summary": sm})
 
-    # ---- stick 侧: 取快照 (oldest pending + latest activity) ----
-    def snapshot_locked(self) -> dict:
-        ap_obj = None
-        if self.pending:
-            first_id = next(iter(self.pending))
-            ap = self.pending[first_id]
-            ap_obj = {
-                "id": ap.id,
-                "agent": ap.agent,
-                "tool": ap.tool,
-                "title": ap.title,
-                "detail": ap.detail,
-                "cwd": ap.cwd,
-                "count": len(self.pending),
-                "age_ms": int((time.time() - ap.created) * 1000),
-                "timeout_ms": ap.timeout_ms,
+    def status_snapshot(self) -> dict:
+        with self.cond:
+            agents = sorted(self.agents.values(), key=lambda x: x["ts"], reverse=True)
+            return {
+                "ble": self.ble_connected,
+                "pending": len(self.pending),
+                "agents": [dict(a) for a in agents],
             }
-        return {
-            "version": self.version,
-            "now": time.time(),
-            "approval": ap_obj,
-            "activity": self.activity,
-        }
-
-    def poll(self, known_version: int, wait_sec: float) -> dict:
-        with self.cond:
-            self.last_stick_poll = time.time()
-            if self.version == known_version and wait_sec > 0:
-                self.cond.wait(timeout=wait_sec)
-            return self.snapshot_locked()
 
 
 STATE = State()
 
 
 # =============================================================================
-# HTTP handler
+# HTTP handler (只剩 hook 入口 + 状态页, 都跑在回环上)
 # =============================================================================
 class Handler(BaseHTTPRequestHandler):
-    server_version = "agent_approver_relay/1.0"
+    server_version = "agent_approver_relay/2.0"
 
-    def log_message(self, fmt: str, *args) -> None:  # 静音默认日志
+    def log_message(self, fmt: str, *args) -> None:
         pass
 
-    # ---- 小工具 ----
     def _read_json(self, max_len: int = 256 * 1024) -> Optional[dict]:
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -262,14 +320,10 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    # ---- GET ----
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
         if path == "/healthz":
             self._text(200, "ok")
-            return
-        if path == "/stick/poll":
-            self._handle_poll()
             return
         if path == "/":
             self._handle_status_page()
@@ -280,24 +334,25 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/hook/approval":
             self._handle_approval()
             return
-        if self.path == "/hook/activity":
-            self._handle_activity()
+        if self.path == "/hook/status":
+            self._handle_status()
             return
-        if self.path == "/stick/decide":
-            self._handle_decide()
+        if self.path == "/hook/activity":  # 向后兼容旧 hook
+            self._handle_activity()
             return
         self._json(404, {"err": f"unknown path: {self.path}"})
 
-    # ---- /hook/approval (阻塞) ----
     def _handle_approval(self) -> None:
         req = self._read_json()
         if req is None:
             return
         title = _trim_utf8(str(req.get("title") or "").strip() or "(no title)", MAX_TITLE_BYTES)
         detail = _trim_utf8(str(req.get("detail") or "").strip(), MAX_DETAIL_BYTES)
+        agent = str(req.get("agent") or "agent")[:48]
         ap = Approval(
             id=str(req.get("id") or uuid.uuid4().hex),
-            agent=str(req.get("agent") or "agent")[:32],
+            agent=agent,
+            agent_id=str(req.get("agent_id") or ("legacy:" + agent))[:120],
             tool=str(req.get("tool") or "")[:48],
             title=title,
             detail=detail,
@@ -308,158 +363,114 @@ class Handler(BaseHTTPRequestHandler):
         decision = STATE.submit_approval(ap)
         self._json(200, {"decision": decision, "id": ap.id})
 
-    # ---- /hook/activity (快) ----
+    def _handle_status(self) -> None:
+        req = self._read_json()
+        if req is None:
+            return
+        label = str(req.get("label") or "agent")[:48]
+        STATE.set_status(
+            agent_id=str(req.get("agent_id") or ("legacy:" + label))[:120],
+            label=label,
+            source=str(req.get("source") or "")[:24],
+            state=str(req.get("state") or "busy")[:12],
+            kind=str(req.get("kind") or "")[:24],
+            text=str(req.get("text") or ""),
+            cwd=str(req.get("cwd") or "")[:200],
+            summary=str(req.get("summary") or ""),
+        )
+        self._json(200, {"ok": True})
+
     def _handle_activity(self) -> None:
         req = self._read_json()
         if req is None:
             return
-        STATE.set_activity(
-            agent=str(req.get("agent") or "agent")[:32],
+        agent = str(req.get("agent") or "agent")[:48]
+        STATE.set_status(
+            agent_id="legacy:" + agent,
+            label=agent,
+            source="",
+            state="busy",
             kind=str(req.get("kind") or "")[:24],
             text=str(req.get("text") or ""),
             cwd=str(req.get("cwd") or "")[:200],
         )
         self._json(200, {"ok": True})
 
-    # ---- /stick/decide ----
-    def _handle_decide(self) -> None:
-        req = self._read_json(max_len=4096)
-        if req is None:
-            return
-        ap_id = str(req.get("id") or "")
-        decision = str(req.get("decision") or "")
-        if decision not in ("allow", "deny"):
-            self._json(400, {"err": "decision must be allow|deny"})
-            return
-        ok = STATE.decide(ap_id, decision)
-        self._json(200, {"ok": ok})
-
-    # ---- /stick/poll (long-poll) ----
-    def _handle_poll(self) -> None:
-        qs = {}
-        if "?" in self.path:
-            for kv in self.path.split("?", 1)[1].split("&"):
-                if "=" in kv:
-                    k, v = kv.split("=", 1)
-                    qs[k] = v
-        try:
-            known_version = int(qs.get("v", "0"))
-        except ValueError:
-            known_version = 0
-        try:
-            wait_sec = max(0.0, min(30.0, float(qs.get("wait", "25"))))
-        except ValueError:
-            wait_sec = 25.0
-        snap = STATE.poll(known_version, wait_sec)
-        self._json(200, snap)
-
-    # ---- 状态网页 ----
     def _handle_status_page(self) -> None:
-        with STATE.cond:
-            snap = STATE.snapshot_locked()
-            recent = list(STATE.recent[-20:])
-            online = STATE.stick_online()
+        snap = STATE.status_snapshot()
+        online = snap["ble"]
         rows = "".join(
-            f"<tr><td>{time.strftime('%H:%M:%S', time.localtime(i['ts']))}</td>"
-            f"<td>{_esc(i['agent'])}</td><td>{_esc(i['kind'])}</td>"
-            f"<td>{_esc(i['text'])}</td></tr>"
-            for i in reversed(recent)
-        )
-        ap = snap.get("approval")
-        ap_html = (
-            f"<p><b>待审批:</b> [{_esc(ap['agent'])}] {_esc(ap['title'])} "
-            f"(共 {ap['count']} 条)</p>" if ap else "<p>无待审批</p>"
+            f"<tr><td>{time.strftime('%H:%M:%S', time.localtime(a['ts']))}</td>"
+            f"<td>{_esc(a['label'])}</td><td>{_esc(a['state'])}</td>"
+            f"<td>{_esc(a['kind'])}</td><td>{_esc(a['text'])}</td></tr>"
+            for a in snap["agents"]
         )
         html = (
             "<!doctype html><meta charset=utf-8><title>agent_approver relay</title>"
-            "<style>body{font-family:-apple-system,system-ui,sans-serif;max-width:780px;"
+            "<meta http-equiv=refresh content=3>"
+            "<style>body{font-family:-apple-system,system-ui,sans-serif;max-width:820px;"
             "margin:20px auto;padding:0 12px;color:#222}table{width:100%;border-collapse:collapse}"
             "td,th{border-bottom:1px solid #eee;padding:4px 6px;font-size:13px;text-align:left}"
             ".s{padding:6px 10px;border-radius:6px;color:#fff;display:inline-block}"
-            "</style><h2>agent_approver relay</h2>"
+            "</style><h2>agent_approver relay (BLE)</h2>"
             f"<p>StickS3: <span class=s style='background:{'#2e7d32' if online else '#c62828'}'>"
-            f"{'online' if online else 'OFFLINE'}</span> &nbsp; version={snap['version']}</p>"
-            f"{ap_html}<h3>最近活动</h3><table>"
-            "<tr><th>time</th><th>agent</th><th>kind</th><th>text</th></tr>"
+            f"{'connected' if online else 'OFFLINE'}</span> &nbsp; "
+            f"agents={len(snap['agents'])} &nbsp; pending={snap['pending']}</p>"
+            f"<h3>Agents</h3><table>"
+            "<tr><th>updated</th><th>agent</th><th>state</th><th>kind</th><th>doing</th></tr>"
             f"{rows}</table>"
         )
         self._text(200, html, "text/html; charset=utf-8")
 
 
 def _esc(s: str) -> str:
-    return (
-        str(s)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # =============================================================================
-# LAN IP 探测 (给用户填到 StickS3 的 relay URL)
+# 入口
 # =============================================================================
-def _ipconfig_getifaddr(iface: str) -> Optional[str]:
-    try:
-        r = subprocess.run(
-            ["ipconfig", "getifaddr", iface],
-            capture_output=True, text=True, timeout=2,
-        )
-        return r.stdout.strip() or None
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def find_lan_ip() -> str:
-    for iface in ("en0", "en1"):
-        ip = _ipconfig_getifaddr(iface)
-        if ip:
-            return ip
-    try:
-        r = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=2)
-        cur = None
-        skip = False
-        iface_re = re.compile(r"^([a-z][a-z0-9]*): ")
-        for line in r.stdout.splitlines():
-            m = iface_re.match(line)
-            if m:
-                cur = m.group(1)
-                skip = cur == "lo0" or cur.startswith(
-                    ("utun", "ipsec", "ppp", "gif", "stf", "awdl", "llw", "anpi", "bridge")
-                )
-                continue
-            if skip or cur is None:
-                continue
-            s = line.strip()
-            if s.startswith("inet ") and not s.startswith("inet6"):
-                return s.split()[1]
-    except Exception:  # noqa: BLE001
-        pass
-    return "?"
-
-
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="agent_approver relay")
-    ap.add_argument("--host", default=os.environ.get("AGENT_APPROVER_HOST", "0.0.0.0"))
+    ap = argparse.ArgumentParser(description="agent_approver relay (BLE)")
+    ap.add_argument("--host", default=os.environ.get("AGENT_APPROVER_HOST", "127.0.0.1"),
+                    help="hook 明文监听地址 (默认 127.0.0.1 回环)")
     ap.add_argument("--port", type=int,
-                    default=int(os.environ.get("AGENT_APPROVER_PORT", "8799")))
+                    default=int(os.environ.get("AGENT_APPROVER_PORT", "8799")),
+                    help="hook 明文端口 (默认 8799)")
+    ap.add_argument("--ble-name", default=os.environ.get("AGENT_APPROVER_BLE_NAME", "AgentApprover"),
+                    help="StickS3 的 BLE 广播名 (默认 AgentApprover)")
+    ap.add_argument("--ble-address", default=os.environ.get("AGENT_APPROVER_BLE_ADDR", ""),
+                    help="直接指定 stick 的 BLE 地址 (跳过扫描, 更快更稳)")
+    ap.add_argument("--no-ble", action="store_true", help="不启动 BLE (调试用)")
     return ap.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    server.daemon_threads = True
-    lan = find_lan_ip()
-    log(f"listening on http://{args.host}:{args.port}")
-    log(f"hooks  -> http://127.0.0.1:{args.port}")
-    log(f"StickS3 relay URL -> http://{lan}:{args.port}")
+
+    hook_server = ThreadingHTTPServer((args.host, args.port), Handler)
+    hook_server.daemon_threads = True
+
+    if args.no_ble:
+        log("BLE 已禁用 (--no-ble), stick 会一直离线")
+    elif ble_mod is None:
+        log("!! 没装 bleak, BLE 不可用 -> hook 会一直回退. 装: pip3 install bleak")
+    else:
+        worker = ble_mod.BleWorker(
+            STATE, name=args.ble_name,
+            address=(args.ble_address or None), log=log,
+        )
+        worker.start()
+        log(f"BLE worker started (找 '{args.ble_name}')")
+
+    log(f"hooks   -> http://127.0.0.1:{args.port}   (给 hook.py)")
     log(f"status page -> http://127.0.0.1:{args.port}/")
     try:
-        server.serve_forever()
+        hook_server.serve_forever()
     except KeyboardInterrupt:
         log("shutting down")
     finally:
-        server.server_close()
+        hook_server.server_close()
     return 0
 
 

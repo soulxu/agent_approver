@@ -1,7 +1,7 @@
 // =============================================================================
 // app_prefs.h - 轻量配置 (NVS Preferences), namespace = "aaprefs".
-//   - relayUrl:   Mac 上 relay 的地址, 形如 "http://192.168.1.100:8799" (无尾斜杠)
 //   - brightness: 屏幕亮度 0..255 (默认 128)
+// 纯 BLE 版本不再需要 relay URL: Mac 直接通过蓝牙连过来.
 // =============================================================================
 #pragma once
 
@@ -10,9 +10,6 @@
 namespace app_prefs {
 
 void begin();
-
-String   relayUrl();
-void     setRelayUrl(const String& url);
 
 uint8_t  brightness();
 void     setBrightness(uint8_t v);

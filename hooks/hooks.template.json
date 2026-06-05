@@ -1,20 +1,59 @@
 {
   "version": 1,
   "hooks": {
+    "sessionStart": [
+      { "command": "python3 __HOOK__ status session_start", "timeout": 5 }
+    ],
+    "sessionEnd": [
+      { "command": "python3 __HOOK__ status session_end", "timeout": 5 }
+    ],
+    "beforeSubmitPrompt": [
+      { "command": "python3 __HOOK__ status prompt", "timeout": 10 }
+    ],
     "beforeShellExecution": [
       { "command": "python3 __HOOK__ shell", "timeout": 180 }
+    ],
+    "afterShellExecution": [
+      { "command": "python3 __HOOK__ status shell_done", "timeout": 5 }
     ],
     "beforeMCPExecution": [
       { "command": "python3 __HOOK__ mcp", "timeout": 180 }
     ],
-    "afterFileEdit": [
-      { "command": "python3 __HOOK__ activity edit", "timeout": 5 }
+    "afterMCPExecution": [
+      { "command": "python3 __HOOK__ status mcp_done", "timeout": 5 }
     ],
-    "beforeSubmitPrompt": [
-      { "command": "python3 __HOOK__ activity prompt", "timeout": 5 }
+    "beforeReadFile": [
+      { "command": "python3 __HOOK__ status read", "timeout": 10 }
+    ],
+    "afterFileEdit": [
+      { "command": "python3 __HOOK__ status edit", "timeout": 5 }
+    ],
+    "afterAgentResponse": [
+      { "command": "python3 __HOOK__ status response", "timeout": 5 }
+    ],
+    "afterAgentThought": [
+      { "command": "python3 __HOOK__ status thought", "timeout": 5 }
+    ],
+    "preCompact": [
+      { "command": "python3 __HOOK__ status compact", "timeout": 5 }
+    ],
+    "subagentStart": [
+      { "command": "python3 __HOOK__ status subagent_start", "timeout": 10 }
+    ],
+    "subagentStop": [
+      { "command": "python3 __HOOK__ status subagent_stop", "timeout": 5 }
+    ],
+    "preToolUse": [
+      { "command": "python3 __HOOK__ status tool", "timeout": 10 }
+    ],
+    "postToolUse": [
+      { "command": "python3 __HOOK__ status tool_done", "timeout": 5 }
+    ],
+    "postToolUseFailure": [
+      { "command": "python3 __HOOK__ status tool_fail", "timeout": 5 }
     ],
     "stop": [
-      { "command": "python3 __HOOK__ activity stop", "timeout": 5 }
+      { "command": "python3 __HOOK__ status stop", "timeout": 5 }
     ]
   }
 }

@@ -4,15 +4,17 @@
 #
 # 一个脚本多种模式, 模式由命令行第 1 个参数决定:
 #
-#   hook.py shell         beforeShellExecution: 危险命令 -> 发到 StickS3 等批准;
-#                         安全命令 -> 直接放行 + 上报活动. 返回 permission JSON.
-#   hook.py mcp           beforeMCPExecution: 按配置决定是否要批准 (默认只上报).
-#   hook.py activity edit      afterFileEdit   -> 上报 "编辑 <file>"
-#   hook.py activity read      beforeReadFile  -> 上报 "读取 <file>"
-#   hook.py activity prompt    beforeSubmitPrompt -> 上报 "任务: <prompt>"
-#   hook.py activity stop      stop            -> 上报 "完成 / 空闲"
+#   hook.py shell           beforeShellExecution: 危险命令 -> 发到 StickS3 等批准;
+#                           安全命令 -> 直接放行 + 上报状态. 返回 permission JSON.
+#   hook.py mcp             beforeMCPExecution: 按配置决定是否要批准 (默认只上报).
+#   hook.py status <label>  其它所有 hook: 把 agent 当前在干什么上报给 relay.
+#                           <label> 见 STATUS_SPEC, 例如 prompt/edit/read/stop/...
 #
-# StickS3 离线 / relay 没起 / 超时  -> 回退 (默认 "ask", 即交回 Cursor 原生审批),
+# 每个事件都带 conversation_id, 用它区分 "同时在跑的多个 agent"; 用 workspace
+# 根目录名当 agent 的显示标签. relay 按 agent 聚合, StickS3 上能总览多个 agent,
+# 按键钻进某一个看详情.
+#
+# StickS3 离线 / relay 没起 / 超时  -> 回退 (默认 "ask", 交回 Cursor 原生审批),
 # 绝不会把 agent 卡死.
 #
 # 配置 (可选): ~/.config/agent_approver/config.json  (见 config.example.json)
@@ -20,10 +22,13 @@
 # =============================================================================
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sys
+import tempfile
+import time
 import urllib.request
 from pathlib import Path
 
@@ -38,14 +43,14 @@ DEFAULTS = {
     "shell_mode": "risky",   # "risky" | "all" | "off"
     "mcp_mode": "off",       # "all" | "off"
     "fallback": "ask",       # relay/stick 不可用时: "ask" | "allow" | "deny"
-    "activity": True,
+    "activity": True,        # 是否上报状态
     "risky_patterns": [],    # 追加到内置列表的额外正则
 }
 
 # 内置 "危险命令" 正则 (大小写不敏感). 命中任意一条 -> 需要 StickS3 批准.
 BUILTIN_RISKY = [
     r"\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|-r\s+-f|-f\s+-r)\b",
-    r"\brm\s+-[a-z]*r",            # 任意 rm -r...
+    r"\brm\s+-[a-z]*r",
     r"\bsudo\b",
     r"\bgit\s+push\b",
     r"\bgit\s+reset\s+--hard\b",
@@ -60,15 +65,38 @@ BUILTIN_RISKY = [
     r"\bdiskutil\s+(erase|partition|reformat)",
     r"\b(shutdown|reboot|halt)\b",
     r"\b(killall|pkill)\b",
-    r"\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba)?sh",   # 管道喂 shell
-    r">\s*/dev/(sd|disk|null)?",                      # 写 /dev
+    r"\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba)?sh",
+    r">\s*/dev/(sd|disk|null)?",
     r"\bnpm\s+publish\b",
     r"\bbrew\s+uninstall\b",
     r"\bshred\b|\btruncate\b",
-    r":\(\)\s*\{",                                    # fork bomb
+    r":\(\)\s*\{",
     r"\bsecurity\s+delete",
     r"\bdefaults\s+delete\b",
 ]
+
+# 各 status 事件 -> (state, response)
+#   state    : 上报给屏幕的状态分类 busy/idle/end
+#   response : 该 hook 要不要回 permission, 以免挡住 agent
+#              "allow"=回 {permission:allow}; "continue"=回 {continue:true}; "none"=不回
+STATUS_SPEC = {
+    "session_start":  ("idle", "none"),
+    "session_end":    ("end",  "none"),
+    "prompt":         ("busy", "continue"),
+    "shell_done":     ("busy", "none"),
+    "mcp_done":       ("busy", "none"),
+    "read":           ("busy", "allow"),
+    "edit":           ("busy", "none"),
+    "response":       ("busy", "none"),
+    "thought":        ("busy", "none"),
+    "compact":        ("busy", "none"),
+    "subagent_start": ("busy", "allow"),
+    "subagent_stop":  ("busy", "none"),
+    "tool":           ("busy", "allow"),
+    "tool_done":      ("busy", "none"),
+    "tool_fail":      ("busy", "none"),
+    "stop":           ("idle", "none"),
+}
 
 
 def load_config() -> dict:
@@ -78,13 +106,62 @@ def load_config() -> dict:
             user = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             if isinstance(user, dict):
                 cfg.update(user)
-    except Exception:  # noqa: BLE001  - 配置坏了也不能挡住 agent
+    except Exception:  # noqa: BLE001
         pass
     return cfg
 
 
-def agent_name() -> str:
+def source_name() -> str:
     return os.environ.get("AGENT_APPROVER_AGENT", "cursor")
+
+
+# ----- 标题暂存 -----
+# beforeShellExecution 拿不到 agent 对命令的自然语言描述 (agent_message), 但
+# preToolUse 能拿到. 所以在 preToolUse 里把 "命令 -> 描述" 暂存到临时文件,
+# beforeShellExecution 再取出来当审批标题. 取不到就退回用命令头几个 token.
+_STASH = os.path.join(tempfile.gettempdir(), "agent_approver_titles.json")
+
+
+def _stash_key(agent: str, command: str) -> str:
+    return hashlib.sha1((agent + "\n" + command).encode("utf-8")).hexdigest()[:16]
+
+
+def _stash_load() -> dict:
+    try:
+        with open(_STASH, encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _stash_save(d: dict) -> None:
+    try:
+        tmp = _STASH + f".{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        os.replace(tmp, _STASH)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def stash_title(agent: str, command: str, msg: str) -> None:
+    if not command or not msg:
+        return
+    d = _stash_load()
+    now = time.time()
+    d = {k: v for k, v in d.items() if now - v.get("ts", 0) < 180}  # 删过期的
+    d[_stash_key(agent, command)] = {"msg": msg[:120], "ts": now}
+    if len(d) > 64:
+        d = dict(sorted(d.items(), key=lambda kv: kv[1].get("ts", 0))[-64:])
+    _stash_save(d)
+
+
+def pop_title(agent: str, command: str) -> str:
+    if not command:
+        return ""
+    v = _stash_load().get(_stash_key(agent, command))
+    return str(v.get("msg") or "") if v else ""
 
 
 def read_event() -> dict:
@@ -110,6 +187,25 @@ def event_cwd(ev: dict) -> str:
     return os.getcwd()
 
 
+def agent_id(ev: dict) -> str:
+    for k in ("conversation_id", "session_id", "parent_conversation_id", "generation_id"):
+        v = ev.get(k)
+        if isinstance(v, str) and v:
+            return v
+    cwd = event_cwd(ev)
+    return "ws:" + cwd if cwd else "default"
+
+
+def agent_label(ev: dict) -> str:
+    cwd = event_cwd(ev)
+    name = ""
+    if cwd:
+        name = os.path.basename(cwd.rstrip("/")) or cwd
+    if not name:
+        name = source_name()
+    return name[:24]
+
+
 # ----- HTTP 小工具 (stdlib, 失败不抛) -----
 def post_json(url: str, obj: dict, timeout: float) -> "dict | None":
     data = json.dumps(obj).encode("utf-8")
@@ -123,26 +219,36 @@ def post_json(url: str, obj: dict, timeout: float) -> "dict | None":
         return None
 
 
-def send_activity(cfg: dict, kind: str, text: str, cwd: str) -> None:
+def send_status(cfg: dict, ev: dict, state: str, kind: str, text: str,
+                summary: str = "") -> None:
     if not cfg.get("activity", True):
         return
-    post_json(
-        cfg["url"].rstrip("/") + "/hook/activity",
-        {"agent": agent_name(), "kind": kind, "text": text, "cwd": cwd},
-        timeout=1.5,
-    )
+    payload = {
+        "agent_id": agent_id(ev),
+        "label": agent_label(ev),
+        "source": source_name(),
+        "state": state,
+        "kind": kind,
+        "text": text,
+        "cwd": event_cwd(ev),
+    }
+    if summary:
+        payload["summary"] = summary  # agent 返回的总结 (完成时在详情页翻页看)
+    post_json(cfg["url"].rstrip("/") + "/hook/status", payload, timeout=1.5)
 
 
-def request_approval(cfg: dict, tool: str, title: str, detail: str, cwd: str) -> str:
+def request_approval(cfg: dict, ev: dict, tool: str, title: str, detail: str) -> str:
     timeout_ms = int(cfg.get("approval_timeout_ms", 150000))
     resp = post_json(
         cfg["url"].rstrip("/") + "/hook/approval",
         {
-            "agent": agent_name(),
+            "agent_id": agent_id(ev),
+            "agent": agent_label(ev),
+            "source": source_name(),
             "tool": tool,
             "title": title,
             "detail": detail,
-            "cwd": cwd,
+            "cwd": event_cwd(ev),
             "timeout_ms": timeout_ms,
         },
         timeout=timeout_ms / 1000.0 + 15.0,
@@ -182,7 +288,7 @@ def decision_to_permission(cfg: dict, decision: str, what: str) -> None:
             user_message=f"你在 StickS3 上拒绝了: {what}",
             agent_message="User denied this action on the StickS3 approver.",
         )
-    else:  # timeout | unavailable | 其它
+    else:
         fallback_permission(cfg, decision)
 
 
@@ -200,32 +306,45 @@ def is_risky(command: str, cfg: dict) -> bool:
     return False
 
 
+def shell_title(command: str) -> str:
+    """从命令里抽一个简短标题 (程序名 + 子命令), 完整命令放 detail 里."""
+    toks = command.split()
+    if not toks:
+        return "命令"
+    # 跳过前置环境变量赋值 (FOO=bar cmd ...)
+    idx = 0
+    while idx < len(toks) and "=" in toks[idx] and not toks[idx].startswith("-"):
+        idx += 1
+    head = toks[idx:idx + 2] if idx < len(toks) else toks[:2]
+    title = " ".join(head) if head else "命令"
+    return title[:48]
+
+
 def mode_shell(cfg: dict) -> None:
     ev = read_event()
     command = str(ev.get("command") or ev.get("commandLine") or "").strip()
-    cwd = event_cwd(ev)
     shell_mode = str(cfg.get("shell_mode", "risky"))
 
     if shell_mode == "off" or not command:
-        send_activity(cfg, "shell", "$ " + command, cwd)
+        send_status(cfg, ev, "busy", "shell", "$ " + command)
         emit("allow")
         return
 
     need = shell_mode == "all" or is_risky(command, cfg)
     if not need:
-        send_activity(cfg, "shell", "$ " + command, cwd)
+        send_status(cfg, ev, "busy", "shell", "$ " + command)
         emit("allow")
         return
 
-    title = "$ " + (command if len(command) <= 120 else command[:117] + "...")
-    decision = request_approval(cfg, "shell", title, command, cwd)
-    decision_to_permission(cfg, decision, title)
+    # 标题优先用 agent 自己的描述 (preToolUse 暂存的 agent_message), 取不到再退回命令头
+    title = pop_title(agent_id(ev), command) or shell_title(command)
+    decision = request_approval(cfg, ev, "shell", title, command)  # 完整命令进 detail
+    decision_to_permission(cfg, decision, "$ " + command)
 
 
 def mode_mcp(cfg: dict) -> None:
     ev = read_event()
     tool = str(ev.get("tool_name") or ev.get("toolName") or ev.get("name") or "mcp")
-    cwd = event_cwd(ev)
     raw_args = ev.get("tool_input") or ev.get("arguments") or ev.get("input") or {}
     try:
         detail = json.dumps(raw_args, ensure_ascii=False)[:500]
@@ -233,33 +352,12 @@ def mode_mcp(cfg: dict) -> None:
         detail = str(raw_args)[:500]
 
     if str(cfg.get("mcp_mode", "off")) != "all":
-        send_activity(cfg, "mcp", tool, cwd)
+        send_status(cfg, ev, "busy", "mcp", "MCP " + tool)
         emit("allow")
         return
 
-    decision = request_approval(cfg, "mcp", f"MCP: {tool}", detail, cwd)
+    decision = request_approval(cfg, ev, "mcp", f"MCP: {tool}", detail)
     decision_to_permission(cfg, decision, f"MCP {tool}")
-
-
-def mode_activity(cfg: dict, label: str) -> None:
-    ev = read_event()
-    cwd = event_cwd(ev)
-    if label == "edit":
-        f = ev.get("file_path") or ev.get("filePath") or ev.get("path") or ""
-        send_activity(cfg, "edit", "编辑 " + _short_path(str(f)), cwd)
-    elif label == "read":
-        f = ev.get("file_path") or ev.get("filePath") or ev.get("path") or ""
-        send_activity(cfg, "read", "读取 " + _short_path(str(f)), cwd)
-    elif label == "prompt":
-        p = str(ev.get("prompt") or ev.get("text") or "").strip().replace("\n", " ")
-        if len(p) > 160:
-            p = p[:157] + "..."
-        send_activity(cfg, "prompt", "任务: " + p, cwd)
-    elif label == "stop":
-        send_activity(cfg, "stop", "完成, 空闲中", cwd)
-    else:
-        send_activity(cfg, label, str(ev.get("text") or label), cwd)
-    # activity 类事件不需要返回 permission, 直接结束.
 
 
 def _short_path(p: str) -> str:
@@ -267,6 +365,75 @@ def _short_path(p: str) -> str:
         return "(file)"
     parts = p.replace("\\", "/").split("/")
     return "/".join(parts[-2:]) if len(parts) > 2 else p
+
+
+def _clip(s: str, n: int) -> str:
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def status_text(label: str, ev: dict) -> str:
+    if label == "prompt":
+        return "任务: " + _clip(ev.get("prompt") or ev.get("text") or "", 140)
+    if label == "thought":
+        return "思考: " + _clip(ev.get("text") or "", 120)
+    if label == "response":
+        return "回复: " + _clip(ev.get("text") or "", 120)
+    if label == "edit":
+        f = ev.get("file_path") or ev.get("filePath") or ev.get("path") or ""
+        return "编辑 " + _short_path(str(f))
+    if label == "read":
+        f = ev.get("file_path") or ev.get("filePath") or ev.get("path") or ""
+        return "读取 " + _short_path(str(f))
+    if label == "shell_done":
+        return "完成命令 " + _clip(ev.get("command") or "", 80)
+    if label == "mcp_done":
+        return "完成 MCP " + str(ev.get("tool_name") or "")
+    if label == "tool":
+        return "调用 " + str(ev.get("tool_name") or "tool")
+    if label == "tool_done":
+        return "完成 " + str(ev.get("tool_name") or "tool")
+    if label == "tool_fail":
+        return "失败 " + str(ev.get("tool_name") or "tool") + ": " + _clip(ev.get("error_message") or "", 60)
+    if label == "compact":
+        return "压缩上下文 " + str(ev.get("context_usage_percent") or "") + "%"
+    if label == "subagent_start":
+        return "子任务: " + _clip(ev.get("task") or "", 100)
+    if label == "subagent_stop":
+        return "子任务完成 (" + str(ev.get("status") or "") + ")"
+    if label == "session_start":
+        return "会话开始 (" + str(ev.get("composer_mode") or "agent") + ")"
+    if label == "session_end":
+        return "会话结束"
+    if label == "stop":
+        return "完成, 空闲中"
+    return label
+
+
+def mode_status(cfg: dict, label: str) -> None:
+    ev = read_event()
+    spec = STATUS_SPEC.get(label, ("busy", "none"))
+    state, response = spec
+
+    # preToolUse: 暂存 agent 对命令的描述, 供随后的 beforeShellExecution 当标题
+    if label == "tool":
+        ti = ev.get("tool_input")
+        cmd = ti.get("command") if isinstance(ti, dict) else None
+        am = ev.get("agent_message") or ""
+        if cmd and am:
+            stash_title(agent_id(ev), str(cmd), str(am))
+    # agent 的最终回复 -> 当作 "总结" 一起发, 详情页可翻页查看
+    summary = ""
+    if label == "response":
+        summary = _clip(ev.get("text") or "", 1500)
+    elif label == "subagent_stop":
+        summary = _clip(ev.get("summary") or "", 1500)
+    send_status(cfg, ev, state, label, status_text(label, ev), summary=summary)
+    if response == "allow":
+        emit("allow")
+    elif response == "continue":
+        print(json.dumps({"continue": True}))
+    # "none": 不输出, fire-and-forget
 
 
 def main() -> int:
@@ -278,10 +445,11 @@ def main() -> int:
             mode_shell(cfg)
         elif mode == "mcp":
             mode_mcp(cfg)
-        elif mode == "activity":
-            mode_activity(cfg, args[1] if len(args) > 1 else "")
+        elif mode == "status":
+            mode_status(cfg, args[1] if len(args) > 1 else "")
+        elif mode == "activity":  # 向后兼容旧模板
+            mode_status(cfg, args[1] if len(args) > 1 else "")
         else:
-            # 未知模式: 安全起见放行, 不挡 agent.
             emit("allow")
     except Exception:  # noqa: BLE001 - 任何异常都别挡住 agent
         if mode in ("shell", "mcp"):
