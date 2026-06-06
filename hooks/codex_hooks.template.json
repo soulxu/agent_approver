@@ -1,0 +1,34 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "AGENT_APPROVER_AGENT=codex python3 __HOOK__ claude session_start", "timeout": 10 } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "AGENT_APPROVER_AGENT=codex python3 __HOOK__ claude session_end", "timeout": 10 } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "AGENT_APPROVER_AGENT=codex python3 __HOOK__ claude prompt", "timeout": 10 } ] }
+    ],
+    "PreToolUse": [
+      { "hooks": [ { "type": "command", "command": "AGENT_APPROVER_AGENT=codex python3 __HOOK__ claude pretool", "timeout": 10 } ] }
+    ],
+    "PostToolUse": [
+      { "hooks": [ { "type": "command", "command": "AGENT_APPROVER_AGENT=codex python3 __HOOK__ claude posttool", "timeout": 10 } ] }
+    ],
+    "PreCompact": [
+      { "hooks": [ { "type": "command", "command": "AGENT_APPROVER_AGENT=codex python3 __HOOK__ claude precompact", "timeout": 10 } ] }
+    ],
+    "PostCompact": [
+      { "hooks": [ { "type": "command", "command": "AGENT_APPROVER_AGENT=codex python3 __HOOK__ claude postcompact", "timeout": 10 } ] }
+    ],
+    "SubagentStart": [
+      { "hooks": [ { "type": "command", "command": "AGENT_APPROVER_AGENT=codex python3 __HOOK__ claude subagent_start", "timeout": 10 } ] }
+    ],
+    "SubagentStop": [
+      { "hooks": [ { "type": "command", "command": "AGENT_APPROVER_AGENT=codex python3 __HOOK__ claude subagent_stop", "timeout": 10 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "AGENT_APPROVER_AGENT=codex python3 __HOOK__ claude stop", "timeout": 15 } ] }
+    ]
+  }
+}

@@ -134,6 +134,16 @@ relay 的 hook 接口是 agent 无关的。接新 agent 只要让它的 hook 机
 - 完成时（`Stop`）用 `last_assistant_message` 当总结，详情页可翻页看。
 新开一个 Claude 会话即生效。
 
+### Codex
+Codex 的 lifecycle hooks 跟 Claude 几乎一模一样（stdin 收 JSON、字段相同），所以**复用同一套 `hook.py claude <event>`**，只是模板里设 `AGENT_APPROVER_AGENT=codex`。`install.sh` 检测到 `~/.codex`（或 PATH 里有 `codex`）时，把 `hooks/codex_hooks.template.json` 合并进 `~/.codex/hooks.json`。
+
+跟 Claude 一样**只做状态显示，不负责审批**：
+- Codex 的文件编辑工具是 `apply_patch`（已在 `hook.py` 里识别）；
+- 多个 Codex 会话按 `session_id` 各算一个 agent；
+- 完成时（`Stop`）用 `last_assistant_message` 当总结。
+
+注意：Codex 出于安全，新增/改动的 hook 默认不信任，**首次需在 Codex CLI 里跑 `/hooks` 审核并信任**后才会执行。
+
 ## 卸载
 ```bash
 agent_approver/install.sh --uninstall

@@ -437,23 +437,23 @@ def mode_status(cfg: dict, label: str) -> None:
 
 
 # =============================================================================
-# Claude Code 支持
+# Claude Code / Codex 支持 (两者 hook 协议几乎一致, 共用这套 handler)
 #
-# Claude Code 的 hook 协议跟 Cursor 不同 (事件名/输入字段/输出格式都不一样),
-# 但 relay 是 agent 无关的, 所以只在这里做一层翻译, 复用同一个 relay:
-#   - agent 区分: 用 Claude 的 session_id (agent_id() 已会优先读它)
-#   - 标题: Bash 工具自带 description 字段 = agent 对命令的描述
-#   - 总结: Stop / SubagentStop 自带 last_assistant_message = 最终回复
+# 它们的 hook 协议跟 Cursor 不同, 但彼此相同: 都是 stdin 收一个 JSON,
+# 共享字段 session_id / cwd / hook_event_name, 工具事件带 tool_name / tool_input.
+# relay 是 agent 无关的, 这里只做一层翻译, 复用同一个 relay:
+#   - agent 区分: 用 session_id (agent_id() 已会优先读它)
+#   - source: 由各自模板里的 AGENT_APPROVER_AGENT=claude|codex 决定
+#   - 总结: Stop 自带 last_assistant_message = 最终回复
 #
-# PreToolUse 输出 (放行/拒绝/交回):
-#   {"hookSpecificOutput":{"hookEventName":"PreToolUse",
-#                          "permissionDecision":"allow|deny|ask",...}}
-# 不输出任何东西 = 不干预, 交给 Claude 自己的权限系统.
+# Claude / Codex 都只做状态显示, 不负责审批 (审批交回它们自己的权限系统),
+# 所以这些 handler 从不输出 permissionDecision, 完全不干预 agent 执行.
+# Codex 的文件编辑工具是 apply_patch (Claude 是 Edit/Write 等).
 # =============================================================================
 def claude_kind(tool: str) -> str:
     if tool == "Bash":
         return "shell"
-    if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit", "Update"):
+    if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit", "Update", "apply_patch"):
         return "edit"
     if tool == "Read":
         return "read"
@@ -466,6 +466,8 @@ def claude_tool_text(tool: str, ti: dict) -> str:
     ti = ti if isinstance(ti, dict) else {}
     if tool == "Bash":
         return "$ " + _clip(ti.get("command") or "", 120)
+    if tool == "apply_patch":  # Codex 的文件编辑工具
+        return "编辑 apply_patch"
     if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit", "Update"):
         return "编辑 " + _short_path(str(ti.get("file_path") or ti.get("notebook_path") or ""))
     if tool == "Read":
