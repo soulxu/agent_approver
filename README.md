@@ -126,9 +126,10 @@ relay 的 hook 接口是 agent 无关的。接新 agent 只要让它的 hook 机
 `install.sh` 把 `hooks/hooks.template.json`（覆盖全部 hook 事件）合并进 `~/.cursor/hooks.json`。
 
 ### Claude Code
-`install.sh` 检测到 `~/.claude`（或 PATH 里有 `claude`）时，会把 `hooks/claude_settings.template.json` 合并进 `~/.claude/settings.json`，复用同一个 `hook.py`（`hook.py claude <event>`，并设 `AGENT_APPROVER_AGENT=claude`）：
-- 危险 `Bash` 命令 → StickS3 审批（标题用 Bash 工具自带的 `description`）；
-- 其它工具不拦截，交回 Claude 自己的权限系统，只上报状态；
+`install.sh` 检测到 `~/.claude`（或 PATH 里有 `claude`）时，会把 `hooks/claude_settings.template.json` 合并进 `~/.claude/settings.json`，复用同一个 `hook.py`（`hook.py claude <event>`，并设 `AGENT_APPROVER_AGENT=claude`）。
+
+**Claude 只做状态显示，不负责审批**（审批交给 Claude 自己的权限系统）：
+- 所有工具只在 StickS3 总览/详情里上报状态，不拦截、不弹审批；
 - 多个 Claude 会话按 `session_id` 各算一个 agent；
 - 完成时（`Stop`）用 `last_assistant_message` 当总结，详情页可翻页看。
 新开一个 Claude 会话即生效。

@@ -483,52 +483,13 @@ def claude_tool_text(tool: str, ti: dict) -> str:
     return "调用 " + (tool or "tool")
 
 
-def emit_claude_pre(decision: str, reason: str = "") -> None:
-    out = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision}}
-    if reason:
-        out["hookSpecificOutput"]["permissionDecisionReason"] = reason
-    print(json.dumps(out))
-
-
-def _claude_decision(cfg: dict, decision: str, what: str) -> None:
-    if decision == "allow":
-        emit_claude_pre("allow", "在 StickS3 上批准")
-    elif decision == "deny":
-        emit_claude_pre("deny", f"在 StickS3 上拒绝: {what}")
-    else:
-        fb = str(cfg.get("fallback", "ask"))
-        if fb == "allow":
-            emit_claude_pre("allow", "approver 不可用, 放行")
-        elif fb == "deny":
-            emit_claude_pre("deny", "approver 不可用, 拒绝")
-        # "ask": 不输出 -> 交给 Claude 自己的权限流程
-
-
 def claude_pretool(cfg: dict) -> None:
+    # Claude 只上报状态, 不负责审批 (审批交给 Claude 自己的权限系统).
+    # 不输出任何东西 = 完全不干预 Claude 的执行.
     ev = read_event()
     tool = str(ev.get("tool_name") or "")
     ti = ev.get("tool_input") or {}
     send_status(cfg, ev, "busy", claude_kind(tool), claude_tool_text(tool, ti))
-
-    if tool == "Bash":
-        command = str((ti.get("command") if isinstance(ti, dict) else "") or "").strip()
-        sm = str(cfg.get("shell_mode", "risky"))
-        if command and sm != "off" and (sm == "all" or is_risky(command, cfg)):
-            desc = str((ti.get("description") if isinstance(ti, dict) else "") or "").strip()
-            title = desc or shell_title(command)
-            decision = request_approval(cfg, ev, "shell", title, command)
-            _claude_decision(cfg, decision, "$ " + command)
-            return
-
-    if tool.startswith("mcp__") and str(cfg.get("mcp_mode", "off")) == "all":
-        try:
-            detail = json.dumps(ti, ensure_ascii=False)[:500]
-        except Exception:  # noqa: BLE001
-            detail = str(ti)[:500]
-        decision = request_approval(cfg, ev, "mcp", "MCP: " + tool, detail)
-        _claude_decision(cfg, decision, "MCP " + tool)
-        return
-    # 其它工具不拦截: 不输出, 交给 Claude 自己的权限系统
 
 
 def claude_status(cfg: dict, label: str) -> None:
