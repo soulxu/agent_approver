@@ -118,9 +118,20 @@ relay 会自动扫描并连接 `AgentApprover`。**首次连接会触发 BLE 配
 
 relay 的 hook 接口是 agent 无关的。接新 agent 只要让它的 hook 机制调到同样的 HTTP：
 - 批准：`POST /hook/approval {agent_id,agent,tool,title,detail,cwd,timeout_ms}` → `{decision}`
-- 状态：`POST /hook/status {agent_id,label,source,state,kind,text,cwd}`（`state` = `busy|idle|end`，`end` 表示该 agent 结束、从总览移除）
+- 状态：`POST /hook/status {agent_id,label,source,state,kind,text,cwd,summary}`（`state` = `busy|idle|end`，`end` 表示该 agent 结束、从总览移除；`summary` 是完成后详情页翻页看的总结）
 
-`agent_id` 用来在总览里区分多个并发 agent（Cursor 用 `conversation_id`）。`hook.py` 已经能复用：给对应 agent 设环境变量 `AGENT_APPROVER_AGENT=claude`，再按各 agent 的 hook 文档把事件接到 `hook.py shell|mcp|status <label>` 即可。Cursor 已经接好（`hooks/hooks.template.json` 覆盖了全部 hook 事件）。
+`agent_id` 用来在总览里区分多个并发 agent（Cursor 用 `conversation_id`，Claude 用 `session_id`）。
+
+### Cursor
+`install.sh` 把 `hooks/hooks.template.json`（覆盖全部 hook 事件）合并进 `~/.cursor/hooks.json`。
+
+### Claude Code
+`install.sh` 检测到 `~/.claude`（或 PATH 里有 `claude`）时，会把 `hooks/claude_settings.template.json` 合并进 `~/.claude/settings.json`，复用同一个 `hook.py`（`hook.py claude <event>`，并设 `AGENT_APPROVER_AGENT=claude`）：
+- 危险 `Bash` 命令 → StickS3 审批（标题用 Bash 工具自带的 `description`）；
+- 其它工具不拦截，交回 Claude 自己的权限系统，只上报状态；
+- 多个 Claude 会话按 `session_id` 各算一个 agent；
+- 完成时（`Stop`）用 `last_assistant_message` 当总结，详情页可翻页看。
+新开一个 Claude 会话即生效。
 
 ## 卸载
 ```bash

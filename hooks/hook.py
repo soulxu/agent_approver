@@ -436,6 +436,136 @@ def mode_status(cfg: dict, label: str) -> None:
     # "none": 不输出, fire-and-forget
 
 
+# =============================================================================
+# Claude Code 支持
+#
+# Claude Code 的 hook 协议跟 Cursor 不同 (事件名/输入字段/输出格式都不一样),
+# 但 relay 是 agent 无关的, 所以只在这里做一层翻译, 复用同一个 relay:
+#   - agent 区分: 用 Claude 的 session_id (agent_id() 已会优先读它)
+#   - 标题: Bash 工具自带 description 字段 = agent 对命令的描述
+#   - 总结: Stop / SubagentStop 自带 last_assistant_message = 最终回复
+#
+# PreToolUse 输出 (放行/拒绝/交回):
+#   {"hookSpecificOutput":{"hookEventName":"PreToolUse",
+#                          "permissionDecision":"allow|deny|ask",...}}
+# 不输出任何东西 = 不干预, 交给 Claude 自己的权限系统.
+# =============================================================================
+def claude_kind(tool: str) -> str:
+    if tool == "Bash":
+        return "shell"
+    if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit", "Update"):
+        return "edit"
+    if tool == "Read":
+        return "read"
+    if tool.startswith("mcp__"):
+        return "mcp"
+    return "tool"
+
+
+def claude_tool_text(tool: str, ti: dict) -> str:
+    ti = ti if isinstance(ti, dict) else {}
+    if tool == "Bash":
+        return "$ " + _clip(ti.get("command") or "", 120)
+    if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit", "Update"):
+        return "编辑 " + _short_path(str(ti.get("file_path") or ti.get("notebook_path") or ""))
+    if tool == "Read":
+        return "读取 " + _short_path(str(ti.get("file_path") or ""))
+    if tool in ("Glob", "Grep"):
+        return "搜索 " + _clip(ti.get("pattern") or "", 60)
+    if tool == "WebFetch":
+        return "抓取 " + _clip(ti.get("url") or "", 80)
+    if tool == "WebSearch":
+        return "搜索 " + _clip(ti.get("query") or "", 60)
+    if tool == "Task":
+        return "子任务 " + _clip(ti.get("description") or "", 60)
+    if tool.startswith("mcp__"):
+        return "MCP " + tool
+    return "调用 " + (tool or "tool")
+
+
+def emit_claude_pre(decision: str, reason: str = "") -> None:
+    out = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision}}
+    if reason:
+        out["hookSpecificOutput"]["permissionDecisionReason"] = reason
+    print(json.dumps(out))
+
+
+def _claude_decision(cfg: dict, decision: str, what: str) -> None:
+    if decision == "allow":
+        emit_claude_pre("allow", "在 StickS3 上批准")
+    elif decision == "deny":
+        emit_claude_pre("deny", f"在 StickS3 上拒绝: {what}")
+    else:
+        fb = str(cfg.get("fallback", "ask"))
+        if fb == "allow":
+            emit_claude_pre("allow", "approver 不可用, 放行")
+        elif fb == "deny":
+            emit_claude_pre("deny", "approver 不可用, 拒绝")
+        # "ask": 不输出 -> 交给 Claude 自己的权限流程
+
+
+def claude_pretool(cfg: dict) -> None:
+    ev = read_event()
+    tool = str(ev.get("tool_name") or "")
+    ti = ev.get("tool_input") or {}
+    send_status(cfg, ev, "busy", claude_kind(tool), claude_tool_text(tool, ti))
+
+    if tool == "Bash":
+        command = str((ti.get("command") if isinstance(ti, dict) else "") or "").strip()
+        sm = str(cfg.get("shell_mode", "risky"))
+        if command and sm != "off" and (sm == "all" or is_risky(command, cfg)):
+            desc = str((ti.get("description") if isinstance(ti, dict) else "") or "").strip()
+            title = desc or shell_title(command)
+            decision = request_approval(cfg, ev, "shell", title, command)
+            _claude_decision(cfg, decision, "$ " + command)
+            return
+
+    if tool.startswith("mcp__") and str(cfg.get("mcp_mode", "off")) == "all":
+        try:
+            detail = json.dumps(ti, ensure_ascii=False)[:500]
+        except Exception:  # noqa: BLE001
+            detail = str(ti)[:500]
+        decision = request_approval(cfg, ev, "mcp", "MCP: " + tool, detail)
+        _claude_decision(cfg, decision, "MCP " + tool)
+        return
+    # 其它工具不拦截: 不输出, 交给 Claude 自己的权限系统
+
+
+def claude_status(cfg: dict, label: str) -> None:
+    ev = read_event()
+    if label == "prompt":
+        send_status(cfg, ev, "busy", "prompt",
+                    "任务: " + _clip(ev.get("prompt") or ev.get("user_prompt") or "", 140))
+    elif label == "posttool":
+        tool = str(ev.get("tool_name") or "")
+        send_status(cfg, ev, "busy", claude_kind(tool), "完成 " + (tool or "tool"))
+    elif label == "stop":
+        summary = _clip(ev.get("last_assistant_message") or "", 1500)
+        send_status(cfg, ev, "idle", "stop", "完成, 空闲中", summary=summary)
+    elif label == "posttool_fail":
+        tool = str(ev.get("tool_name") or "")
+        send_status(cfg, ev, "busy", claude_kind(tool), "失败 " + (tool or "tool"))
+    elif label == "subagent_start":
+        send_status(cfg, ev, "busy", "subagent_start",
+                    "子任务开始 (" + str(ev.get("agent_type") or "") + ")")
+    elif label == "subagent_stop":
+        send_status(cfg, ev, "busy", "subagent_stop", "子任务完成")
+    elif label == "precompact":
+        send_status(cfg, ev, "busy", "compact", "压缩上下文 (" + str(ev.get("trigger") or "") + ")")
+    elif label == "postcompact":
+        send_status(cfg, ev, "busy", "compact", "压缩完成")
+    elif label == "setup":
+        send_status(cfg, ev, "idle", "setup", "初始化 (" + str(ev.get("trigger") or "") + ")")
+    elif label == "session_start":
+        send_status(cfg, ev, "idle", "session_start", "会话开始 (" + str(ev.get("source") or "") + ")")
+    elif label == "session_end":
+        send_status(cfg, ev, "end", "session_end", "会话结束")
+    elif label == "stopfail":
+        send_status(cfg, ev, "idle", "stopfail", "回合出错 (" + str(ev.get("matcher") or "") + ")")
+    elif label == "notification":
+        send_status(cfg, ev, "busy", "notification", _clip(ev.get("message") or "", 120))
+
+
 def main() -> int:
     cfg = load_config()
     args = sys.argv[1:]
@@ -449,11 +579,18 @@ def main() -> int:
             mode_status(cfg, args[1] if len(args) > 1 else "")
         elif mode == "activity":  # 向后兼容旧模板
             mode_status(cfg, args[1] if len(args) > 1 else "")
+        elif mode == "claude":
+            sub = args[1] if len(args) > 1 else ""
+            if sub == "pretool":
+                claude_pretool(cfg)
+            else:
+                claude_status(cfg, sub)
         else:
             emit("allow")
     except Exception:  # noqa: BLE001 - 任何异常都别挡住 agent
         if mode in ("shell", "mcp"):
             fallback_permission(cfg, "hook error")
+        # claude / status: 出错就不输出, 交给 agent 自己处理, 别卡住
     return 0
 
 
