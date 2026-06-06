@@ -12,6 +12,9 @@
     "PreToolUse": [
       { "hooks": [ { "type": "command", "command": "AGENT_APPROVER_AGENT=codex python3 __HOOK__ claude pretool", "timeout": 10 } ] }
     ],
+    "PermissionRequest": [
+      { "hooks": [ { "type": "command", "command": "AGENT_APPROVER_AGENT=codex python3 __HOOK__ claude permission", "timeout": 200 } ] }
+    ],
     "PostToolUse": [
       { "hooks": [ { "type": "command", "command": "AGENT_APPROVER_AGENT=codex python3 __HOOK__ claude posttool", "timeout": 10 } ] }
     ],

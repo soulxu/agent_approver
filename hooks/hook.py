@@ -446,8 +446,10 @@ def mode_status(cfg: dict, label: str) -> None:
 #   - source: 由各自模板里的 AGENT_APPROVER_AGENT=claude|codex 决定
 #   - 总结: Stop 自带 last_assistant_message = 最终回复
 #
-# Claude / Codex 都只做状态显示, 不负责审批 (审批交回它们自己的权限系统),
-# 所以这些 handler 从不输出 permissionDecision, 完全不干预 agent 执行.
+# 审批走 PermissionRequest 事件 (Claude/Codex 都有): 它正好在 agent 要弹批准框
+# 时触发, 我们转到 StickS3, 返回 {"decision":{"behavior":"allow|deny"}} 就直接
+# 替用户决定, 不会再在 agent 里弹第二次. PreToolUse 只上报状态、不审批 (避免双弹).
+# 取不到 approver 时按 fallback (默认 ask=不输出, 交回 agent 自己的批准弹窗).
 # Codex 的文件编辑工具是 apply_patch (Claude 是 Edit/Write 等).
 # =============================================================================
 def claude_kind(tool: str) -> str:
@@ -486,12 +488,62 @@ def claude_tool_text(tool: str, ti: dict) -> str:
 
 
 def claude_pretool(cfg: dict) -> None:
-    # Claude 只上报状态, 不负责审批 (审批交给 Claude 自己的权限系统).
-    # 不输出任何东西 = 完全不干预 Claude 的执行.
+    # PreToolUse 只上报状态, 不负责审批 (审批走 PermissionRequest, 见下).
+    # 不输出任何东西 = 完全不干预 agent 执行.
     ev = read_event()
     tool = str(ev.get("tool_name") or "")
     ti = ev.get("tool_input") or {}
     send_status(cfg, ev, "busy", claude_kind(tool), claude_tool_text(tool, ti))
+
+
+def emit_permission(behavior: str, message: str = "") -> None:
+    # Claude / Codex 共用的 PermissionRequest 输出格式
+    decision = {"behavior": behavior}
+    if behavior == "deny" and message:
+        decision["message"] = message
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PermissionRequest", "decision": decision}}))
+
+
+def claude_permission(cfg: dict) -> None:
+    # PermissionRequest: agent 真要弹批准框时才触发 -> 转到 StickS3.
+    # 返回 allow/deny 就直接替用户决定, 不会再在 agent 里弹一次.
+    # 取不到 approver 时不输出 (或按 fallback), 交回 agent 自己的批准弹窗.
+    ev = read_event()
+    tool = str(ev.get("tool_name") or "")
+    ti = ev.get("tool_input") if isinstance(ev.get("tool_input"), dict) else {}
+    desc = str(ti.get("description") or "").strip()
+
+    if tool == "Bash":
+        detail = str(ti.get("command") or "")
+        title = desc or shell_title(detail)
+        kind = "shell"
+    elif tool == "apply_patch":
+        detail = str(ti.get("command") or "")
+        title = desc or "apply_patch"
+        kind = "edit"
+    else:
+        try:
+            detail = json.dumps(ti, ensure_ascii=False)[:800]
+        except Exception:  # noqa: BLE001
+            detail = str(ti)[:800]
+        title = desc or claude_tool_text(tool, ti)
+        kind = claude_kind(tool)
+
+    send_status(cfg, ev, "wait", kind, "等待批准: " + title)
+    decision = request_approval(cfg, ev, kind, title, detail)
+
+    if decision == "allow":
+        emit_permission("allow")
+    elif decision == "deny":
+        emit_permission("deny", "在 StickS3 上拒绝")
+    else:
+        fb = str(cfg.get("fallback", "ask"))
+        if fb == "allow":
+            emit_permission("allow")
+        elif fb == "deny":
+            emit_permission("deny", "approver 不可用")
+        # "ask": 不输出 -> 交回 agent 自己的批准弹窗
 
 
 def claude_status(cfg: dict, label: str) -> None:
@@ -546,6 +598,8 @@ def main() -> int:
             sub = args[1] if len(args) > 1 else ""
             if sub == "pretool":
                 claude_pretool(cfg)
+            elif sub == "permission":
+                claude_permission(cfg)
             else:
                 claude_status(cfg, sub)
         else:

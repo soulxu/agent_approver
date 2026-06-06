@@ -15,6 +15,9 @@
     "PreToolUse": [
       { "matcher": "*", "hooks": [ { "type": "command", "command": "AGENT_APPROVER_AGENT=claude python3 __HOOK__ claude pretool", "timeout": 10 } ] }
     ],
+    "PermissionRequest": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "AGENT_APPROVER_AGENT=claude python3 __HOOK__ claude permission", "timeout": 200 } ] }
+    ],
     "PostToolUse": [
       { "matcher": "*", "hooks": [ { "type": "command", "command": "AGENT_APPROVER_AGENT=claude python3 __HOOK__ claude posttool", "timeout": 10 } ] }
     ],

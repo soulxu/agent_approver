@@ -128,8 +128,8 @@ relay 的 hook 接口是 agent 无关的。接新 agent 只要让它的 hook 机
 ### Claude Code
 `install.sh` 检测到 `~/.claude`（或 PATH 里有 `claude`）时，会把 `hooks/claude_settings.template.json` 合并进 `~/.claude/settings.json`，复用同一个 `hook.py`（`hook.py claude <event>`，并设 `AGENT_APPROVER_AGENT=claude`）。
 
-**Claude 只做状态显示，不负责审批**（审批交给 Claude 自己的权限系统）：
-- 所有工具只在 StickS3 总览/详情里上报状态，不拦截、不弹审批；
+- 状态显示：所有工具事件在 StickS3 总览/详情里上报状态；
+- **审批：走 `PermissionRequest` 事件**——Claude 真要弹批准框时才触发，转到 StickS3；在 stick 上批准/拒绝后直接替你决定，**不会再在 Claude 里弹第二次**；relay 不可用时按 `fallback`（默认 `ask` = 交回 Claude 自己的弹窗）；
 - 多个 Claude 会话按 `session_id` 各算一个 agent；
 - 完成时（`Stop`）用 `last_assistant_message` 当总结，详情页可翻页看。
 新开一个 Claude 会话即生效。
@@ -137,12 +137,13 @@ relay 的 hook 接口是 agent 无关的。接新 agent 只要让它的 hook 机
 ### Codex
 Codex 的 lifecycle hooks 跟 Claude 几乎一模一样（stdin 收 JSON、字段相同），所以**复用同一套 `hook.py claude <event>`**，只是模板里设 `AGENT_APPROVER_AGENT=codex`。`install.sh` 检测到 `~/.codex`（或 PATH 里有 `codex`）时，把 `hooks/codex_hooks.template.json` 合并进 `~/.codex/hooks.json`。
 
-跟 Claude 一样**只做状态显示，不负责审批**：
+跟 Claude 一样支持**状态显示 + 审批**：
+- 审批走 Codex 的 `PermissionRequest` 事件，stick 上批准即放行，不再在 Codex 里弹第二次；
 - Codex 的文件编辑工具是 `apply_patch`（已在 `hook.py` 里识别）；
 - 多个 Codex 会话按 `session_id` 各算一个 agent；
 - 完成时（`Stop`）用 `last_assistant_message` 当总结。
 
-注意：Codex 出于安全，新增/改动的 hook 默认不信任，**首次需在 Codex CLI 里跑 `/hooks` 审核并信任**后才会执行。
+注意：Codex 出于安全，新增/改动的 hook 默认不信任，**首次需在 Codex CLI 里跑 `/hooks` 审核并信任**后才会执行。改了 hook 命令（比如这次新增 `PermissionRequest`）后也要重新 `/hooks` 信任。
 
 ## 卸载
 ```bash
