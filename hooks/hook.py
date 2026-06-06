@@ -26,6 +26,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -112,11 +113,22 @@ def source_name() -> str:
     return os.environ.get("AGENT_APPROVER_AGENT", "cursor")
 
 
-# ----- 命令标题: 从 transcript 里取 agent 写的 description -----
-# Cursor 的 beforeShellExecution / preToolUse 都不带命令的自然语言描述, 但
-# transcript_path 指向的 JSONL 里有: assistant 消息的 tool_use.input.description.
-# 审批时反查 transcript, 找最近一条 command 匹配的 tool_use, 用它的 description
-# 当标题. 找不到再退回用命令头几个 token.
+# ----- 命令标题 -----
+# Cursor 的 beforeShellExecution / preToolUse 都只给 {command, cwd, timeout},
+# 没有 agent 写的 description. 唯一能拿到 description 的地方是 transcript_path 指向
+# 的 JSONL 里 assistant 消息的 tool_use.input.description. 但该行往往在 hook 被
+# 调用之后才落盘, 所以这里轮询等它出现 (审批本来就要阻塞, 等一下没关系).
+# 匹配用 "互相包含" 容忍 cd 包装 / working_directory.
+def title_with_wait(path: str, command: str, tries: int = 8, delay: float = 0.25) -> str:
+    for i in range(tries):
+        t = title_from_transcript(path, command)
+        if t:
+            return t
+        if i < tries - 1:
+            time.sleep(delay)
+    return ""
+
+
 def title_from_transcript(path: str, command: str) -> str:
     if not path or not command:
         return ""
@@ -145,7 +157,10 @@ def title_from_transcript(path: str, command: str) -> str:
                 continue
             desc = str(inp.get("description") or "").strip()
             cmd = str(inp.get("command") or "").strip()
-            if desc and cmd and cmd == want:
+            if not desc or not cmd:
+                continue
+            # 精确相等; 或互相包含 (Cursor 可能给执行命令加 cd 前缀 / 包装)
+            if cmd == want or (len(cmd) >= 6 and (cmd in want or want in cmd)):
                 return desc[:120]
     return ""
 
@@ -322,8 +337,8 @@ def mode_shell(cfg: dict) -> None:
         emit("allow")
         return
 
-    # 标题优先用 agent 写的 description (从 transcript 反查), 取不到再退回命令头
-    title = title_from_transcript(str(ev.get("transcript_path") or ""), command) or shell_title(command)
+    # 标题: 等 transcript 落盘后取 agent 写的 description, 取不到再退回命令头
+    title = title_with_wait(str(ev.get("transcript_path") or ""), command) or shell_title(command)
     decision = request_approval(cfg, ev, "shell", title, command)  # 完整命令进 detail
     decision_to_permission(cfg, decision, "$ " + command)
 

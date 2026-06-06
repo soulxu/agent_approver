@@ -360,6 +360,8 @@ class Handler(BaseHTTPRequestHandler):
             created=time.time(),
             timeout_ms=int(req.get("timeout_ms") or 150000),
         )
+        log(f"HTTP /hook/approval source={req.get('source')!r} tool={ap.tool!r} "
+            f"title={ap.title!r} detail.head={ap.detail[:60]!r}")
         decision = STATE.submit_approval(ap)
         self._json(200, {"decision": decision, "id": ap.id})
 

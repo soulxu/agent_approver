@@ -142,6 +142,9 @@ class BleWorker(threading.Thread):
             except queue.Empty:
                 break
             data = (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8")
+            nchunks = (len(data) + chunk - 1) // chunk
+            extra = f" title={msg.get('title')!r}" if msg.get("t") == "approval" else ""
+            self.log(f"-> stick t={msg.get('t')} bytes={len(data)} chunk={chunk} x{nchunks}{extra}")
             try:
                 for i in range(0, len(data), chunk):
                     await client.write_gatt_char(NUS_RX, data[i:i + chunk], response=True)
