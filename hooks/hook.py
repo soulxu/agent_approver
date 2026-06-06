@@ -22,13 +22,10 @@
 # =============================================================================
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
 import sys
-import tempfile
-import time
 import urllib.request
 from pathlib import Path
 
@@ -115,53 +112,42 @@ def source_name() -> str:
     return os.environ.get("AGENT_APPROVER_AGENT", "cursor")
 
 
-# ----- 标题暂存 -----
-# beforeShellExecution 拿不到 agent 对命令的自然语言描述 (agent_message), 但
-# preToolUse 能拿到. 所以在 preToolUse 里把 "命令 -> 描述" 暂存到临时文件,
-# beforeShellExecution 再取出来当审批标题. 取不到就退回用命令头几个 token.
-_STASH = os.path.join(tempfile.gettempdir(), "agent_approver_titles.json")
-
-
-def _stash_key(agent: str, command: str) -> str:
-    return hashlib.sha1((agent + "\n" + command).encode("utf-8")).hexdigest()[:16]
-
-
-def _stash_load() -> dict:
-    try:
-        with open(_STASH, encoding="utf-8") as f:
-            d = json.load(f)
-            return d if isinstance(d, dict) else {}
-    except Exception:  # noqa: BLE001
-        return {}
-
-
-def _stash_save(d: dict) -> None:
-    try:
-        tmp = _STASH + f".{os.getpid()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(d, f)
-        os.replace(tmp, _STASH)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def stash_title(agent: str, command: str, msg: str) -> None:
-    if not command or not msg:
-        return
-    d = _stash_load()
-    now = time.time()
-    d = {k: v for k, v in d.items() if now - v.get("ts", 0) < 180}  # 删过期的
-    d[_stash_key(agent, command)] = {"msg": msg[:120], "ts": now}
-    if len(d) > 64:
-        d = dict(sorted(d.items(), key=lambda kv: kv[1].get("ts", 0))[-64:])
-    _stash_save(d)
-
-
-def pop_title(agent: str, command: str) -> str:
-    if not command:
+# ----- 命令标题: 从 transcript 里取 agent 写的 description -----
+# Cursor 的 beforeShellExecution / preToolUse 都不带命令的自然语言描述, 但
+# transcript_path 指向的 JSONL 里有: assistant 消息的 tool_use.input.description.
+# 审批时反查 transcript, 找最近一条 command 匹配的 tool_use, 用它的 description
+# 当标题. 找不到再退回用命令头几个 token.
+def title_from_transcript(path: str, command: str) -> str:
+    if not path or not command:
         return ""
-    v = _stash_load().get(_stash_key(agent, command))
-    return str(v.get("msg") or "") if v else ""
+    want = command.strip()
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:  # noqa: BLE001
+        return ""
+    for line in reversed(lines):
+        if '"tool_use"' not in line or '"description"' not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if not isinstance(b, dict) or b.get("type") != "tool_use":
+                continue
+            inp = b.get("input")
+            if not isinstance(inp, dict):
+                continue
+            desc = str(inp.get("description") or "").strip()
+            cmd = str(inp.get("command") or "").strip()
+            if desc and cmd and cmd == want:
+                return desc[:120]
+    return ""
 
 
 def read_event() -> dict:
@@ -336,8 +322,8 @@ def mode_shell(cfg: dict) -> None:
         emit("allow")
         return
 
-    # 标题优先用 agent 自己的描述 (preToolUse 暂存的 agent_message), 取不到再退回命令头
-    title = pop_title(agent_id(ev), command) or shell_title(command)
+    # 标题优先用 agent 写的 description (从 transcript 反查), 取不到再退回命令头
+    title = title_from_transcript(str(ev.get("transcript_path") or ""), command) or shell_title(command)
     decision = request_approval(cfg, ev, "shell", title, command)  # 完整命令进 detail
     decision_to_permission(cfg, decision, "$ " + command)
 
@@ -415,13 +401,6 @@ def mode_status(cfg: dict, label: str) -> None:
     spec = STATUS_SPEC.get(label, ("busy", "none"))
     state, response = spec
 
-    # preToolUse: 暂存 agent 对命令的描述, 供随后的 beforeShellExecution 当标题
-    if label == "tool":
-        ti = ev.get("tool_input")
-        cmd = ti.get("command") if isinstance(ti, dict) else None
-        am = ev.get("agent_message") or ""
-        if cmd and am:
-            stash_title(agent_id(ev), str(cmd), str(am))
     # agent 的最终回复 -> 当作 "总结" 一起发, 详情页可翻页查看
     summary = ""
     if label == "response":
