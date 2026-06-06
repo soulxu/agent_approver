@@ -14,4 +14,8 @@ void begin();
 uint8_t  brightness();
 void     setBrightness(uint8_t v);
 
+// 提示音风格: false=经典升调; true=低频嗡嗡.
+bool     soundBuzz();
+void     setSoundBuzz(bool v);
+
 }  // namespace app_prefs

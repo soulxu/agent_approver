@@ -71,7 +71,7 @@ static int g_brightIdx = 1;
 // 提示音: 记住上次的计数, 变大就响
 static uint32_t g_lastApprovalChime = 0;
 static uint32_t g_lastDoneChime = 0;
-static bool     g_soundOn = true;
+static bool     g_buzz = false;  // 提示音风格: false=经典升调; true=低频嗡嗡
 
 // 按键 (A/B 都支持短按/长按)
 static uint32_t g_btnAAt = 0; static bool g_btnAHold = false;
@@ -166,9 +166,22 @@ static void applyBrightness() {
   M5.Display.setBrightness(BRIGHT_LEVELS[g_brightIdx]);
 }
 
-// 提示音. approval=要审批 (急促升调); 否则=任务完成 (柔和两声).
+// 提示音. g_buzz=false: 经典升调 (approval 急促升调 / 完成柔和两声).
+//        g_buzz=true:  低频嗡嗡 (approval 急促三声短嗡 / 完成一声长嗡).
 static void playChime(bool approval) {
-  if (!g_soundOn) return;
+  if (g_buzz) {
+    M5.Speaker.setVolume(255);
+    if (approval) {
+      for (int i = 0; i < 3; i++) {
+        M5.Speaker.tone(150, 110); delay(130);
+        M5.Speaker.stop();         delay(70);
+      }
+    } else {
+      M5.Speaker.tone(130, 320); delay(340);
+      M5.Speaker.stop();
+    }
+    return;
+  }
   M5.Speaker.setVolume(180);
   if (approval) {
     M5.Speaker.tone(1175, 90);  delay(110);
@@ -572,10 +585,18 @@ static void approvalNextPage() {
   g_apprPage = (g_apprPage + 1) % g_apprPageCount;
 }
 
-// BtnA 短按: 审批屏 -> 单击翻页 / 双击批准; 否则 -> 选下一个 agent / 切亮度
+// 在 经典提示音 / 嗡嗡提示音 之间切换, 并试听一下当前风格.
+static void toggleChimeStyle() {
+  g_buzz = !g_buzz;
+  app_prefs::setSoundBuzz(g_buzz);
+  setToast(g_buzz ? "\u63d0\u793a\u97f3: \u55e1\u55e1" : "\u63d0\u793a\u97f3: \u7ecf\u5178");  // 提示音: 嗡嗡 / 经典
+  playChime(false);  // 试听
+}
+
+// BtnA 短按: 审批屏 -> 单击翻页 / 双击批准; 列表/详情屏 -> 单击切换 / 双击换提示音
 static void onAShort() {
+  uint32_t now = millis();
   if (g_approval.valid) {
-    uint32_t now = millis();
     if (g_aClickPending && (now - g_aClickAt) <= DOUBLE_MS) {
       g_aClickPending = false;   // 双击 -> 批准
       doApprove();
@@ -584,20 +605,28 @@ static void onAShort() {
       g_aClickAt = now;
     }
   } else if (ble_link::connected() && ble_link::agentCount() > 0) {
-    if (g_ui == UI_DETAIL) detailNextPage();  // 详情屏 A = 翻页看总结
-    else selectNext();                        // 总览屏 A = 选下一个
+    if (g_aClickPending && (now - g_aClickAt) <= DOUBLE_MS) {
+      g_aClickPending = false;   // 双击 -> 切换提示音风格
+      toggleChimeStyle();
+    } else {
+      g_aClickPending = true;    // 先挂起, 等一个双击窗口看是不是单击翻页/选下一个
+      g_aClickAt = now;
+    }
   } else {
     cycleBrightness();
   }
 }
 
-// 单击挂起超过双击窗口 -> 确认是单击 -> 翻页
+// 单击挂起超过双击窗口 -> 确认是单击 -> 执行对应单击动作
 static void resolvePendingClick(uint32_t now) {
   if (!g_aClickPending) return;
-  if (!g_approval.valid) { g_aClickPending = false; return; }
-  if (now - g_aClickAt > DOUBLE_MS) {
-    g_aClickPending = false;
-    approvalNextPage();
+  if (now - g_aClickAt <= DOUBLE_MS) return;
+  g_aClickPending = false;
+  if (g_approval.valid) {
+    approvalNextPage();                       // 审批屏: 翻页
+  } else if (ble_link::connected() && ble_link::agentCount() > 0) {
+    if (g_ui == UI_DETAIL) detailNextPage();  // 详情屏: 翻页看总结
+    else selectNext();                        // 总览屏: 选下一个
   }
 }
 
@@ -668,6 +697,7 @@ void setup() {
   for (int i = 0; i < (int)sizeof(BRIGHT_LEVELS); ++i)
     if (BRIGHT_LEVELS[i] == app_prefs::brightness()) g_brightIdx = i;
   applyBrightness();
+  g_buzz = app_prefs::soundBuzz();
 
   canvas.setPsram(true);
   canvas.setColorDepth(16);

@@ -7,8 +7,10 @@ namespace app_prefs {
 namespace {
 constexpr const char* NS = "aaprefs";
 constexpr const char* KEY_BRIGHT = "bri";
+constexpr const char* KEY_BUZZ = "buzz";
 
 uint8_t g_bright = 128;
+bool    g_buzz = false;
 bool    g_loaded = false;
 
 void load() {
@@ -16,6 +18,7 @@ void load() {
   Preferences p;
   if (p.begin(NS, true /*ro*/)) {
     g_bright = p.getUChar(KEY_BRIGHT, 128);
+    g_buzz = p.getBool(KEY_BUZZ, false);
     p.end();
   }
   g_loaded = true;
@@ -34,6 +37,18 @@ void setBrightness(uint8_t v) {
   g_bright = v;
   Preferences p;
   if (p.begin(NS, false)) { p.putUChar(KEY_BRIGHT, v); p.end(); }
+}
+
+bool soundBuzz() {
+  load();
+  return g_buzz;
+}
+
+void setSoundBuzz(bool v) {
+  load();
+  g_buzz = v;
+  Preferences p;
+  if (p.begin(NS, false)) { p.putBool(KEY_BUZZ, v); p.end(); }
 }
 
 }  // namespace app_prefs
